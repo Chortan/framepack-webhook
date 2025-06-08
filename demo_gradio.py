@@ -1,3 +1,4 @@
+from urllib.parse import quote_plus
 from diffusers_helper.hf_login import login
 
 import os
@@ -27,12 +28,21 @@ from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
 
+from webhook import webhook
+from process_file import compute_sha256, copy_to_gradio_cache
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
 parser.add_argument("--server", type=str, default='0.0.0.0')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
+parser.add_argument(
+    '--webhook-url',
+    type=str,
+    default=os.getenv('WEBHOOK_URL', None),
+    help='URL to POST webhook events'
+)
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -41,9 +51,16 @@ print(args)
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
+webhook_url = args.webhook_url
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
+print(f'Webhook URL: {webhook_url}')
+
+webhook(url=webhook_url, event='starting', data={
+    'free_vram_gb': free_mem_gb,
+    'high_vram': high_vram,
+})
 
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
@@ -97,15 +114,37 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
+webhook(url=webhook_url, event='ready', data={
+    'free_vram_gb': free_mem_gb,
+    'high_vram': high_vram,
+})
 
 @torch.no_grad()
 def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    
+    
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+
+    webhook(url=webhook_url, event='new', data={
+        'id': job_id,
+        'prompt': prompt,
+        'n_prompt': n_prompt,
+        'seed': seed,
+        'total_second_length': total_second_length,
+        'latent_window_size': latent_window_size,
+        'steps': steps,
+        'cfg': cfg,
+        'gs': gs,
+        'rs': rs,
+        'gpu_memory_preservation': gpu_memory_preservation,
+        'use_teacache': use_teacache,
+        'mp4_crf': mp4_crf,
+    })
 
     try:
         # Clean GPU
@@ -217,6 +256,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
             if stream.input_queue.top() == 'end':
                 stream.output_queue.push(('end', None))
+                webhook(url=webhook_url, event='end', data={
+                    'job_id': job_id,
+                    'status': 'interrupted',
+                    'message': 'User ends the task.'
+                })
                 return
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
@@ -252,6 +296,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
                 if stream.input_queue.top() == 'end':
                     stream.output_queue.push(('end', None))
+                    webhook(url=webhook_url, event='end', data={
+                        'job_id': job_id,
+                        'status': 'interrupted',
+                        'message': 'User ends the task.'
+                    })
                     raise KeyboardInterrupt('User ends the task.')
 
                 current_step = d['i'] + 1
@@ -259,6 +308,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
                 hint = f'Sampling {current_step}/{steps}'
                 desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                webhook(url=webhook_url, event='progress', data={
+                    'job_id': job_id,
+                    'current_step': current_step,
+                    'total_steps': steps,
+                    'percentage': percentage,
+                    'desc': desc,
+                })
                 return
 
             generated_latents = sample_hunyuan(
@@ -324,6 +380,19 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
             stream.output_queue.push(('file', output_filename))
 
+            file_hash = compute_sha256(output_filename)
+
+            # Copie dans le cache gradio
+            cached_file_path = copy_to_gradio_cache(output_filename, file_hash)
+
+            webhook(url=webhook_url, event='file', data={
+                'job_id': job_id,
+                'output_filename': output_filename,
+                'total_generated_frames': total_generated_latent_frames * 4 - 3,
+                'video_length_seconds': (total_generated_latent_frames * 4 - 3) / 30,
+                'file_path': str(cached_file_path)
+            })
+
             if is_last_section:
                 break
     except:
@@ -335,6 +404,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             )
 
     stream.output_queue.push(('end', None))
+    webhook(url=webhook_url, event='end', data={
+        'job_id': job_id,
+        'status': 'success',
+        'message': 'Task completed successfully.'
+    })
     return
 
 
